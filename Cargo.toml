@@ -1,0 +1,15 @@
+[package]
+name = "reticulated"
+version = "0.1.0"
+authors = ["Creston Bunch <crestonbunch@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+lexer = { path = "./lexer" }
+
+[workspace]
+members = [
+    "lexer",
+    "parser",
+    "compiler"
+]

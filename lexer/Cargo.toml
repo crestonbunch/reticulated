@@ -1,0 +1,18 @@
+[package]
+name = "lexer"
+version = "0.1.0"
+authors = ["Creston Bunch <crestonbunch@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "buffer"
+harness = false
+
+[[bench]]
+name = "lib"
+harness = false
