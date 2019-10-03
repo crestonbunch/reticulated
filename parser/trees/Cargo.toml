@@ -1,0 +1,9 @@
+[package]
+name = "trees"
+version = "0.1.0"
+authors = ["Creston Bunch <crestonbunch@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+parse = { path = "./parse" }
+syntax = { path = "./syntax" }

@@ -1,50 +1,79 @@
-pub mod buffer;
-use buffer::TokenBuffer;
+use std::io::Read;
 
-mod error;
-mod tokens;
+pub mod buffer;
+pub mod error;
+pub mod tokens;
+
+use buffer::TokenBuffer;
 use error::LexerError;
 use tokens::{NumberBase, StringFlag, Token};
 
-/*
-pub const PYTHON_RESERVED_WORDS: [&str; 35] = [
-    "False", "None", "True", "and", "as", "assert", "async", "await", "break",
-    "class", "continue", "def", "del", "elif", "else", "except", "finally",
-    "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal",
-    "not", "or", "pass", "raise", "return", "try", "while", "with", "yield",
-];
-*/
-
-pub struct TokenContainer {
-    token: Token,
-    line_num: u64,
-    col_num: u64,
+/// A `Span` describes the start and end points of a token. E.g. for presenting
+/// errors to the user, it is helpful to know the location of a token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Span {
+    pub start_line: u64,
+    pub start_col: u64,
+    pub end_line: u64,
+    pub end_col: u64,
 }
 
-impl TokenContainer {
-    fn new(token: Token, line_num: u64, col_num: u64) -> TokenContainer {
-        TokenContainer {
-            token,
-            line_num,
-            col_num,
+impl Span {
+    /// Create a new span with the desired start and end points.
+    pub fn new(
+        start_line: u64,
+        start_col: u64,
+        end_line: u64,
+        end_col: u64,
+    ) -> Span {
+        Span {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
         }
     }
 
-    pub fn token(&self) -> &Token {
-        &self.token
+    /// Create the zero span.
+    pub fn zero() -> Span {
+        Span::new(0, 0, 0, 0)
     }
 
-    pub fn line(&self) -> u64 {
-        self.line_num
-    }
-
-    pub fn col(&self) -> u64 {
-        self.col_num
+    /// Merge two spans together
+    pub fn merge(a: Span, b: Span) -> Span {
+        let mut start_line = a.start_line;
+        let mut start_col = a.start_col;
+        let mut end_line = a.end_line;
+        let mut end_col = a.end_col;
+        if b.start_line < a.start_line {
+            start_line = b.start_line;
+            start_col = b.start_col;
+        } else if b.start_line == a.start_line {
+            start_col = a.start_col.min(b.start_col);
+        }
+        if b.end_line > a.end_line {
+            end_line = b.end_line;
+            end_col = b.end_col;
+        } else if b.end_line == a.end_line {
+            end_col = a.end_col.max(b.end_col);
+        }
+        Span::new(start_line, start_col, end_line, end_col)
     }
 }
 
-pub struct Lexer<'a> {
-    buffer: TokenBuffer<&'a [u8]>,
+pub struct ParsedToken(pub Token, pub Span);
+
+impl ParsedToken {
+    fn new(token: Token, span: Span) -> ParsedToken {
+        ParsedToken(token, span)
+    }
+}
+
+type LexerResult = Result<Option<ParsedToken>, LexerError>;
+type TokenResult = Result<Option<Token>, LexerError>;
+
+pub struct Lexer<R: Read> {
+    buffer: TokenBuffer<R>,
     // A stack of indendation levels if tabs were 8 spaces and 1 space,
     // respectively. Tracking both allows us to catch errors when tab levels
     // depend on the size of a tab in spaces.
@@ -63,32 +92,27 @@ pub struct Lexer<'a> {
     done: bool,
 }
 
-impl<'a> Iterator for Lexer<'a> {
-    type Item = Result<TokenContainer, LexerError<'a>>;
+impl<R: Read> Iterator for Lexer<R> {
+    type Item = Result<ParsedToken, LexerError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // consume input until we find a token
         loop {
             match self.next_token() {
-                Ok(Some(token)) => {
-                    return Some(Ok(token));
-                }
-                Ok(None) => {
-                    if self.done {
-                        return None;
-                    }
-                }
+                Ok(Some(token)) => return Some(Ok(token)),
+                Ok(None) if self.done => return None,
+                Ok(None) => (),
                 Err(err) => return Some(Err(err)),
             }
         }
     }
 }
 
-impl<'a> Lexer<'a> {
+impl<'a, R: Read> Lexer<R> {
     /// Creates a new `Lexer`.
     ///
     /// A lexer reads input from a buffer and parses tokens one at a time.
-    pub fn new(buffer: TokenBuffer<&'a [u8]>) -> Lexer<'a> {
+    pub fn new(buffer: TokenBuffer<R>) -> Lexer<R> {
         Lexer {
             buffer,
             indent_stack: vec![(0, 0)],
@@ -134,16 +158,18 @@ impl<'a> Lexer<'a> {
 
     /// Helper function to wrap the token with the current line and column
     /// number.
-    fn wrap_token(&self, token: Token) -> TokenContainer {
+    fn wrap_token(&self, token: Token) -> ParsedToken {
         let (start_line, start_col) = self.token_start;
-        TokenContainer::new(token, start_line, start_col)
+        let (end_line, end_col) = (self.line_num, self.col_num);
+        let span = Span::new(start_line, start_col, end_line, end_col);
+        ParsedToken::new(token, span)
     }
 
     /// Gets the next token result. If the wrapped Option is None, that means
     /// we handled something that wasn't a token (e.g. whitespace, a line
     /// continuation, etc.). The wrapped option will be an EndMarker when
     /// the input buffer reaches EOF.
-    fn next_token(&mut self) -> Result<Option<TokenContainer>, LexerError<'a>> {
+    fn next_token(&mut self) -> LexerResult {
         if self.done {
             return Ok(None);
         }
@@ -161,7 +187,9 @@ impl<'a> Lexer<'a> {
         let c = self.scan_forward();
         if c.is_none() {
             let token = Token::EndMarker;
-            let token = TokenContainer::new(token, self.line_num, self.col_num);
+            let (line, col) = (self.line_num, self.col_num);
+            let span = Span::new(line, col, line, col);
+            let token = ParsedToken::new(token, span);
             self.done = true;
             return Ok(Some(token));
         }
@@ -178,7 +206,8 @@ impl<'a> Lexer<'a> {
             '\\' => self.handle_line_continuation(),
             _ => self.handle_short_tokens(c),
         };
-        // Track parenthesis level
+        // Track parenthesis level to decide if whitespace should count toward
+        // the indendation level.
         match c {
             '(' | '[' | '{' => self.paren_level += 1,
             ')' | ']' | '}' => self.paren_level -= 1,
@@ -195,7 +224,7 @@ impl<'a> Lexer<'a> {
     /// indentation level and ensuring consistent indentation. Returns an
     /// Indent token when the indentation level increases and a Dedent token
     /// when the indentation level decreases.
-    fn handle_indent(&mut self) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_indent(&mut self) -> TokenResult {
         let mut c = self.scan_forward();
         // Measure the depth of indentations in spaces using tabs of 8 spaces
         // in one variable and tabs of 1 space in another variable.
@@ -282,26 +311,28 @@ impl<'a> Lexer<'a> {
     }
 
     /// Consumes whitespace
-    fn handle_whitespace(&mut self) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_whitespace(&mut self) -> TokenResult {
         self.buffer.pop(); // consume the whitespace
         Ok(None)
     }
 
     /// Consumes newlines and increments the line counter and resets the
     /// column counter.
-    fn handle_newline(&mut self) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_newline(&mut self) -> TokenResult {
         self.line_num += 1;
         self.col_num = 0;
         self.cont = false;
         self.buffer.pop(); // consume the whitespace
-        Ok(None)
+        if self.paren_level > 0 {
+            // New lines inside of parenthesis are ignored
+            return Ok(None);
+        }
+        Ok(Some(Token::NewLine))
     }
 
     /// Consumes line continuations and increments the line counter and resets
     /// the column counter.
-    fn handle_line_continuation(
-        &mut self,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_line_continuation(&mut self) -> TokenResult {
         let c = self.scan_forward();
         if c != Some('\n') {
             return Err(self.handle_unexpected_char());
@@ -314,27 +345,29 @@ impl<'a> Lexer<'a> {
     }
 
     /// Consumes comments
-    fn handle_comment(&mut self) -> Result<Option<Token>, LexerError<'a>> {
-        while match self.scan_forward() {
-            Some('\n') => false,
-            None => return Ok(Some(Token::EndMarker)),
+    fn handle_comment(&mut self) -> TokenResult {
+        let mut c = self.scan_forward();
+        while match c {
+            Some('\n') | None => false,
             _ => true,
-        } {}
-        self.scan_back();
+        } {
+            c = self.scan_forward();
+        }
+        if c.is_some() {
+            // rollback newline characters
+            self.scan_back();
+        }
         self.buffer.pop(); // consume the comment
         Ok(None)
     }
 
     /// Helper function to return an unexpected character error
-    fn handle_unexpected_char(&self) -> LexerError<'a> {
+    fn handle_unexpected_char(&self) -> LexerError {
         LexerError::new("unexpected character", self.line_num, self.col_num)
     }
 
     /// Handles cases where the next token is an identifier.
-    fn handle_identifier(
-        &mut self,
-        c: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_identifier(&mut self, c: char) -> TokenResult {
         // TODO: support unicode identifiers
         let mut x = Some(c);
         while match x {
@@ -349,7 +382,43 @@ impl<'a> Lexer<'a> {
             // The scanned char is not part of the identifier
             self.scan_back();
         }
-        Ok(Some(Token::Name(self.buffer.pop())))
+        let v = self.buffer.pop();
+        match &v[..] {
+            "if" => Ok(Some(Token::If)),
+            "elif" => Ok(Some(Token::Elif)),
+            "else" => Ok(Some(Token::Else)),
+            "raise" => Ok(Some(Token::Raise)),
+            "try" => Ok(Some(Token::Try)),
+            "except" => Ok(Some(Token::Except)),
+            "finally" => Ok(Some(Token::Finally)),
+            "with" => Ok(Some(Token::With)),
+            "for" => Ok(Some(Token::For)),
+            "while" => Ok(Some(Token::While)),
+            "break" => Ok(Some(Token::Break)),
+            "continue" => Ok(Some(Token::Continue)),
+            "pass" => Ok(Some(Token::Pass)),
+            "and" => Ok(Some(Token::And)),
+            "or" => Ok(Some(Token::Or)),
+            "in" => Ok(Some(Token::In)),
+            "is" => Ok(Some(Token::Is)),
+            "not" => Ok(Some(Token::Not)),
+            "yield" => Ok(Some(Token::Yield)),
+            "import" => Ok(Some(Token::Import)),
+            "from" => Ok(Some(Token::From)),
+            "as" => Ok(Some(Token::As)),
+            "lambda" => Ok(Some(Token::Lambda)),
+            "True" => Ok(Some(Token::True)),
+            "False" => Ok(Some(Token::False)),
+            "None" => Ok(Some(Token::None)),
+            "assert" => Ok(Some(Token::Assert)),
+            "del" => Ok(Some(Token::Del)),
+            "return" => Ok(Some(Token::Return)),
+            "global" => Ok(Some(Token::Global)),
+            "nonlocal" => Ok(Some(Token::Nonlocal)),
+            "class" => Ok(Some(Token::Class)),
+            "def" => Ok(Some(Token::Def)),
+            _ => Ok(Some(Token::Name(v))),
+        }
     }
 
     /// Handles cases where the next token is a string.
@@ -357,7 +426,7 @@ impl<'a> Lexer<'a> {
         &mut self,
         c: char,
         flag: Option<StringFlag>,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    ) -> TokenResult {
         let quote = c;
         let mut c = self.scan_forward();
         if c == None {
@@ -432,7 +501,7 @@ impl<'a> Lexer<'a> {
     fn scan_past_digits<F: Fn(char) -> bool>(
         &mut self,
         is_digit: F,
-    ) -> Option<LexerError<'a>> {
+    ) -> Option<LexerError> {
         let mut c = self.scan_forward();
         // The input number must start with a valid digit
         match c {
@@ -472,10 +541,7 @@ impl<'a> Lexer<'a> {
 
     /// Helper function for parsing decimal numbers including fractions,
     /// imaginary, and exponent numbers.
-    fn handle_decimal(
-        &mut self,
-        c: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_decimal(&mut self, c: char) -> TokenResult {
         let mut c = Some(c);
         let mut y = self.scan_forward();
         let is_decimal_digit = |x| match x {
@@ -522,10 +588,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Handles cases where the next token is a number.
-    fn handle_number(
-        &mut self,
-        c: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_number(&mut self, c: char) -> TokenResult {
         let is_hex_digit = |x| match x {
             '0'...'9' | 'a'...'f' | 'A'...'F' => true,
             _ => false,
@@ -588,10 +651,7 @@ impl<'a> Lexer<'a> {
 
     /// Handles cases where a '.' character might be a decimal number or
     /// it might be the start to a Dot or Ellipsis token.
-    fn maybe_handle_number(
-        &mut self,
-        c: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn maybe_handle_number(&mut self, c: char) -> TokenResult {
         let y = self.scan_forward();
         match y {
             Some('0'...'9') => {
@@ -613,7 +673,7 @@ impl<'a> Lexer<'a> {
         x: char,
         y: char,
         z: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    ) -> TokenResult {
         let mut handle = |string_flag| {
             self.scan_back(); // rollback quote
             self.buffer.pop(); // consume leading character
@@ -638,11 +698,7 @@ impl<'a> Lexer<'a> {
 
     /// Helper function to lookahead two characters when matching a Name token
     /// or a String token with leading string flags b, r, u, or f.
-    fn id_double_lookahead(
-        &mut self,
-        x: char,
-        y: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn id_double_lookahead(&mut self, x: char, y: char) -> TokenResult {
         let mut handle = |string_flag| {
             self.scan_back(); // rollback quote
             self.buffer.pop(); // consume leading character
@@ -663,10 +719,7 @@ impl<'a> Lexer<'a> {
 
     /// Function to match a Name token, or sometimes a String token if it
     /// begins with a flag b, r, u, or f.
-    fn maybe_handle_identifier(
-        &mut self,
-        c: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn maybe_handle_identifier(&mut self, c: char) -> TokenResult {
         let x = c;
         let y = self.scan_forward();
         let z = self.scan_forward();
@@ -680,10 +733,7 @@ impl<'a> Lexer<'a> {
     /// Function to handle tokens that are three characters or less in length
     /// and can be easily looked up in a table by looking ahead up to three
     /// characters.
-    fn handle_short_tokens(
-        &mut self,
-        c: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_short_tokens(&mut self, c: char) -> TokenResult {
         let x = c;
         let y = self.scan_forward();
         let z = self.scan_forward();
@@ -699,7 +749,7 @@ impl<'a> Lexer<'a> {
         x: char,
         y: char,
         z: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    ) -> TokenResult {
         let mut pop_return = |t| {
             self.buffer.pop();
             Ok(Some(t))
@@ -717,11 +767,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn handle_two_char_tokens(
-        &mut self,
-        x: char,
-        y: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_two_char_tokens(&mut self, x: char, y: char) -> TokenResult {
         let mut pop_return = |t| {
             self.buffer.pop();
             Ok(Some(t))
@@ -746,6 +792,7 @@ impl<'a> Lexer<'a> {
             ('&', '=') => pop_return(Token::AmperEqual),
             ('^', '=') => pop_return(Token::CircumFlexEqual),
             ('@', '=') => pop_return(Token::AtEqual),
+            (':', '=') => pop_return(Token::ColonEqual),
             (x, _) => {
                 self.scan_back(); // rollback y
                 self.handle_one_char_tokens(x)
@@ -753,10 +800,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn handle_one_char_tokens(
-        &mut self,
-        x: char,
-    ) -> Result<Option<Token>, LexerError<'a>> {
+    fn handle_one_char_tokens(&mut self, x: char) -> TokenResult {
         let mut pop_return = |t| {
             self.buffer.pop();
             Ok(Some(t))
@@ -796,11 +840,11 @@ mod tests {
 
     #[test]
     fn it_handles_whitespace() {
-        let inputs = vec![" ", "\n", "\t", "\n\n\n", "\n\t ", "\t\t  \n\n"];
+        let inputs = vec![" ", "\t", "   \t ", "\t  \t  "];
         for input in inputs {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
-            assert_eq!(lexer.next().unwrap().unwrap().token, Token::EndMarker);
+            let lexer = &mut Lexer::new(input);
+            assert_eq!(lexer.next().unwrap().unwrap().0, Token::EndMarker);
         }
     }
 
@@ -809,7 +853,7 @@ mod tests {
         let inputs = vec!["!"];
         for input in inputs {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
             assert!(lexer.next().unwrap().is_err());
         }
     }
@@ -822,19 +866,32 @@ mod tests {
             "foo. \\\n  bar",
         ];
         let outputs = vec![
-            vec![(0, 0), (1, 0), (2, 0), (2, 4)],
-            vec![(0, 0), (0, 4), (1, 10)],
-            vec![(0, 0), (0, 3), (1, 2)],
+            vec![
+                (0, 0, 0, 3),
+                (0, 3, 1, 0),
+                (1, 0, 1, 3),
+                (1, 3, 2, 0),
+                (2, 0, 2, 3),
+                (2, 4, 2, 8),
+            ],
+            vec![(0, 0, 0, 3), (0, 4, 1, 9), (1, 10, 1, 13)],
+            vec![(0, 0, 0, 3), (0, 3, 0, 4), (1, 2, 1, 5)],
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
 
-            for (expect_line, expect_col) in expect {
+            for e in expect {
                 let actual = lexer.next().unwrap().unwrap();
+                let Span {
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                } = actual.1;
                 assert_eq!(
-                    (actual.line_num, actual.col_num),
-                    (expect_line, expect_col)
+                    (start_line, start_col, end_line, end_col),
+                    (e.0, e.1, e.2, e.3)
                 );
             }
         }
@@ -851,11 +908,11 @@ mod tests {
         ]];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
 
             for expect_token in expect {
                 let actual = lexer.next().unwrap().unwrap();
-                assert_eq!(actual.token, expect_token);
+                assert_eq!(actual.0, expect_token);
             }
         }
     }
@@ -866,11 +923,11 @@ mod tests {
         let outputs = vec![vec![Token::Name("foo".into()), Token::Dot]];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
 
             for expect_token in expect {
                 let actual = lexer.next().unwrap().unwrap();
-                assert_eq!(actual.token, expect_token);
+                assert_eq!(actual.0, expect_token);
             }
             assert!(lexer.next().unwrap().is_err());
         }
@@ -888,7 +945,9 @@ mod tests {
             vec![
                 Token::Indent,
                 Token::Name("foo".to_owned()),
+                Token::NewLine,
                 Token::Name("bar".to_owned()),
+                Token::NewLine,
                 Token::Dedent,
                 Token::Name("baz".to_owned()),
                 Token::EndMarker,
@@ -896,14 +955,19 @@ mod tests {
             vec![
                 Token::Indent,
                 Token::Name("foo".to_owned()),
+                Token::NewLine,
                 Token::Indent,
                 Token::Name("bar".to_owned()),
+                Token::NewLine,
                 Token::Dedent,
                 Token::Name("baz".to_owned()),
                 Token::EndMarker,
             ],
             vec![
                 Token::Name("foo".to_owned()),
+                Token::NewLine,
+                Token::NewLine,
+                Token::NewLine,
                 Token::Indent,
                 Token::Name("baz".to_owned()),
                 Token::EndMarker,
@@ -919,11 +983,11 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
 
             for expect_token in expect {
                 let actual = lexer.next().unwrap().unwrap();
-                assert_eq!(actual.token, expect_token);
+                assert_eq!(actual.0, expect_token);
             }
         }
     }
@@ -941,33 +1005,41 @@ mod tests {
             vec![
                 Token::Indent,
                 Token::Name("foo".into()),
+                Token::NewLine,
                 Token::Indent,
                 Token::Name("bar".into()),
+                Token::NewLine,
             ],
             vec![
                 Token::Indent,
                 Token::Name("foo".into()),
+                Token::NewLine,
                 Token::Indent,
                 Token::Name("bar".into()),
+                Token::NewLine,
             ],
             vec![
                 Token::Indent,
                 Token::Name("foo".into()),
+                Token::NewLine,
                 Token::Name("bar".into()),
+                Token::NewLine,
             ],
-            vec![Token::Indent, Token::Name("foo".into())],
+            vec![Token::Indent, Token::Name("foo".into()), Token::NewLine],
             vec![
                 Token::Indent,
                 Token::Name("foo".into()),
+                Token::NewLine,
                 Token::Indent,
                 Token::Name("bar".into()),
+                Token::NewLine,
             ],
         ];
         for (input, expect_tokens) in inputs.iter().zip(expect) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
             for expect_token in expect_tokens {
-                assert_eq!(lexer.next().unwrap().unwrap().token, expect_token);
+                assert_eq!(lexer.next().unwrap().unwrap().0, expect_token);
             }
             assert!(lexer.next().unwrap().is_err());
         }
@@ -987,11 +1059,11 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
 
             for expect_token in expect {
                 let actual = lexer.next().unwrap().unwrap();
-                assert_eq!(actual.token, expect_token);
+                assert_eq!(actual.0, expect_token);
             }
         }
     }
@@ -1070,11 +1142,11 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
 
             for expect_token in expect {
                 let actual = lexer.next().unwrap().unwrap();
-                assert_eq!(actual.token, expect_token);
+                assert_eq!(actual.0, expect_token);
             }
         }
     }
@@ -1086,7 +1158,7 @@ mod tests {
         ];
         for input in inputs {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
             assert!(lexer.next().unwrap().is_err());
         }
     }
@@ -1103,9 +1175,9 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
             let actual = lexer.next().unwrap().unwrap();
-            assert_eq!(actual.token, expect);
+            assert_eq!(actual.0, expect);
         }
     }
 
@@ -1138,9 +1210,9 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
             let actual = lexer.next().unwrap().unwrap();
-            assert_eq!(actual.token, expect);
+            assert_eq!(actual.0, expect);
         }
     }
 
@@ -1171,9 +1243,9 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
             let actual = lexer.next().unwrap().unwrap();
-            assert_eq!(actual.token, expect);
+            assert_eq!(actual.0, expect);
         }
     }
 
@@ -1187,11 +1259,11 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
 
             for expect_token in expect {
                 let actual = lexer.next().unwrap().unwrap();
-                assert_eq!(actual.token, expect_token);
+                assert_eq!(actual.0, expect_token);
             }
         }
     }
@@ -1212,12 +1284,33 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
 
             for expect_token in expect {
                 let actual = lexer.next().unwrap().unwrap();
-                assert_eq!(actual.token, expect_token);
+                assert_eq!(actual.0, expect_token);
             }
+        }
+    }
+
+    #[test]
+    fn it_parses_keywords() {
+        let inputs =
+            vec!["if", "else", "elif", "continue", "pass", "yield", "break"];
+        let outputs = vec![
+            Token::If,
+            Token::Else,
+            Token::Elif,
+            Token::Continue,
+            Token::Pass,
+            Token::Yield,
+            Token::Break,
+        ];
+        for (input, expect) in inputs.iter().zip(outputs) {
+            let input = TokenBuffer::new(input.as_bytes());
+            let lexer = &mut Lexer::new(input);
+            assert_eq!(lexer.next().unwrap().unwrap().0, expect,);
+            assert_eq!(lexer.next().unwrap().unwrap().0, Token::EndMarker);
         }
     }
 
@@ -1247,12 +1340,12 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
             assert_eq!(
-                lexer.next().unwrap().unwrap().token,
+                lexer.next().unwrap().unwrap().0,
                 Token::String(expect.into(), None)
             );
-            assert_eq!(lexer.next().unwrap().unwrap().token, Token::EndMarker);
+            assert_eq!(lexer.next().unwrap().unwrap().0, Token::EndMarker);
         }
     }
 
@@ -1284,9 +1377,9 @@ mod tests {
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
-            assert_eq!(lexer.next().unwrap().unwrap().token, expect);
-            assert_eq!(lexer.next().unwrap().unwrap().token, Token::EndMarker);
+            let lexer = &mut Lexer::new(input);
+            assert_eq!(lexer.next().unwrap().unwrap().0, expect);
+            assert_eq!(lexer.next().unwrap().unwrap().0, Token::EndMarker);
         }
     }
 
@@ -1312,7 +1405,7 @@ mod tests {
         ];
         for input in inputs {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
+            let lexer = &mut Lexer::new(input);
             assert!(lexer.next().unwrap().is_err());
         }
     }
@@ -1322,14 +1415,18 @@ mod tests {
         let inputs =
             vec!["# hello world", "# hello world\nfoo", "foo # hello world"];
         let outputs = vec![
-            Token::EndMarker,
-            Token::Name("foo".into()),
-            Token::Name("foo".into()),
+            vec![Token::EndMarker],
+            vec![Token::NewLine, Token::Name("foo".into()), Token::EndMarker],
+            vec![Token::Name("foo".into()), Token::EndMarker],
         ];
         for (input, expect) in inputs.iter().zip(outputs) {
             let input = TokenBuffer::new(input.as_bytes());
-            let mut lexer = Lexer::new(input);
-            assert_eq!(lexer.next().unwrap().unwrap().token, expect);
+            let lexer = &mut Lexer::new(input);
+
+            for expect_token in expect {
+                let actual = lexer.next().unwrap().unwrap();
+                assert_eq!(actual.0, expect_token);
+            }
         }
     }
 
@@ -1337,9 +1434,9 @@ mod tests {
     fn it_parses_entire_buffers() {
         let input = "+";
         let input = TokenBuffer::new(input.as_bytes());
-        let mut lexer = Lexer::new(input);
-        assert_eq!(lexer.next().unwrap().unwrap().token, Token::Plus);
-        assert_eq!(lexer.next().unwrap().unwrap().token, Token::EndMarker);
+        let lexer = &mut Lexer::new(input);
+        assert_eq!(lexer.next().unwrap().unwrap().0, Token::Plus);
+        assert_eq!(lexer.next().unwrap().unwrap().0, Token::EndMarker);
         assert!(lexer.next().is_none());
     }
 
@@ -1348,11 +1445,11 @@ mod tests {
         let input = "def test_func(param: int, **kwargs) -> int: \
                      \n\treturn param**2";
         let input = TokenBuffer::new(input.as_bytes());
-        let lexer = Lexer::new(input);
+        let lexer = &mut Lexer::new(input);
         let mut i = 0;
         for _ in lexer {
             i += 1;
         }
-        assert_eq!(19, i);
+        assert_eq!(20, i);
     }
 }

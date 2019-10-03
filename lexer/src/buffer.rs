@@ -50,7 +50,7 @@ pub struct TokenBuffer<R: Read> {
 /// assert_eq!(buf.scan_forward().unwrap(), 'e');
 /// assert_eq!(buf.pop(), "He");
 /// ```
-impl<R: Read> TokenBuffer<R> {
+impl<'a, R: Read> TokenBuffer<R> {
     pub fn new(mut read: R) -> TokenBuffer<R> {
         let mut buf: [u8; 2 * BUFFER_LEN] = [0; 2 * BUFFER_LEN];
         let end = read.read(&mut buf).unwrap();
@@ -163,7 +163,7 @@ impl<R: Read> TokenBuffer<R> {
         let curr_bytes = &self.buf[self.begin..self.forward];
         let result = str::from_utf8(curr_bytes);
         self.begin = self.forward;
-        result.unwrap().to_owned()
+        String::from(result.unwrap())
     }
 }
 

@@ -1,0 +1,9 @@
+[package]
+name = "grammar"
+version = "0.1.0"
+authors = ["Creston Bunch <crestonbunch@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+lexer = { path = "../../lexer" }
+metagrammar = { path = "../metagrammar" }

@@ -5,3 +5,6 @@ authors = ["Creston Bunch <crestonbunch@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+lexer = { path = "../lexer" }
+grammar = { path = "./grammar" }
+trees = { path = "./trees" }

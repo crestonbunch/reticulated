@@ -1,0 +1,10 @@
+[package]
+name = "parse"
+version = "0.1.0"
+authors = ["Creston Bunch <crestonbunch@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+lexer = { path = "../../../lexer" }
+grammar = { path = "../../grammar" }
+syntax = { path = "../syntax" }

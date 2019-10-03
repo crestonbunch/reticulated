@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 lexer = { path = "./lexer" }
+parser = { path = "./parser" }
 
 [workspace]
 members = [
